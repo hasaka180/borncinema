@@ -34,3 +34,12 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# isolated build output
+/.next-build
+
+# prototype json store
+/.data
+
+# source font (the build uses the copy in src/fonts/)
+/Zapf Humanist 601 Demi Regular.otf

@@ -1,4 +1,9 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {};
-
+const nextConfig = {
+  // Allow `NEXT_DIST_DIR=.next-build next build` so a build never clobbers a running dev server.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
+  images: {
+    remotePatterns: [{ protocol: "https", hostname: "images.unsplash.com" }],
+  },
+};
 export default nextConfig;
