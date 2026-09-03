@@ -504,6 +504,18 @@ html.lenis, html.lenis body { height: auto; }
 
 .marquee { display: flex; width: max-content; animation: marquee 60s linear infinite; }
 
+/* Genre rail: rows that drift past on small screens, paused while touched. */
+.genre-track { overflow: hidden; }
+.genre-marquee { display: flex; width: max-content; animation: marquee 34s linear infinite; }
+.genre-marquee--rev { animation-duration: 42s; animation-direction: reverse; }
+.genre-track:active .genre-marquee, .genre-marquee:hover { animation-play-state: paused; }
+.genre-fade { -webkit-mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent); mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent); }
+@media (prefers-reduced-motion: reduce) {
+  .genre-track { overflow-x: auto; }
+  .genre-marquee { animation: none; }
+  .genre-marquee > [aria-hidden="true"] { display: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
   body::after { animation: none; }

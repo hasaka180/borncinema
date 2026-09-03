@@ -4,6 +4,7 @@ import { HowItWorks } from "@/components/hero/HowItWorks";
 import { IntroVeil } from "@/components/hero/IntroVeil";
 import { StoryCard } from "@/components/story/StoryCard";
 import { StoryRail } from "@/components/story/StoryRail";
+import { GenreRail } from "@/components/story/GenreRail";
 import { SectionHead } from "@/components/ui/SectionHead";
 import { Reveal } from "@/components/ui/Reveal";
 import { Still } from "@/components/ui/Still";
@@ -52,18 +53,8 @@ export default async function Home() {
       {/* DISCOVER WHAT PEOPLE ARE IMAGINING */}
       <section className="mt-32 md:mt-44 px-6 md:px-14">
         <Reveal><SectionHead eyebrow="Genres" title="Discover what people are imagining" size="md" href="/discover" /></Reveal>
-        <Reveal className="mt-12">
-          <div className="flex flex-wrap gap-3">
-            {GENRES.map((g) => {
-              const count = stories.filter((s) => s.genre === g).length;
-              return (
-                <Link key={g} href={`/discover?genre=${encodeURIComponent(g)}`} className="group inline-flex items-baseline gap-3 rounded-full border border-line px-5 py-3 hover:border-accent transition-colors">
-                  <span className="display text-lg md:text-xl text-ink group-hover:text-accent transition-colors">{g}</span>
-                  <span className="label-sm text-ink-3">{count || "·"}</span>
-                </Link>
-              );
-            })}
-          </div>
+        <Reveal className="mt-10">
+          <GenreRail genres={GENRES.map((g) => ({ genre: g, count: all.filter((s) => s.genre === g).length }))} />
         </Reveal>
       </section>
 
