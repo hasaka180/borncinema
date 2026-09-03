@@ -6,159 +6,184 @@ import { cn } from "@/lib/utils";
 
 /**
  * CINEMATIC TUNNEL
- * Scroll flies the camera down a corridor of screens.
- * Scroll VELOCITY, not position, drives the motion blur: hard scrubbing smears
- * the corridor while the titles (a separate, unfiltered layer) stay sharp.
+ * Scroll flies the camera down a corridor of screens. Scroll VELOCITY, not position,
+ * drives the motion blur, so hard scrubbing smears the corridor while the titles,
+ * which live in their own unfiltered layer, stay sharp.
+ *
+ * Geometry: a scattered cloud of small screens, each yawed to face the centre, spread
+ * through a ring so the middle of the frame stays clear. Depth wraps, so the corridor
+ * never runs out and nothing pops in or out.
  */
 
-const RINGS = 12;
-const SPACING = 640; // px between rings along z
-const DEPTH = SPACING * (RINGS - 1);
-const END_Z = -(DEPTH + 900); // the end-wall
+const COUNT = 40;
+const SPACING = 265;
+const DEPTH = COUNT * SPACING;
+const PERSPECTIVE = 1000;
+const NEAR_FADE = 340;
 
-type Wall = "L" | "R" | "T" | "B";
+/** The panes are small; ask the CDN for small art so decode and compositing stay cheap. */
+const thumb = (url: string) => url.replace(/([?&])w=\d+/, "$1w=420").replace(/([?&])q=\d+/, "$1q=55");
+
+type Screen = {
+  x: number; y: number; z: number; yaw: number;
+  w: number; h: number;
+  story: (typeof stories)[number];
+};
+
+/** Deterministic scatter so server and client agree. */
+function build(count: number): Screen[] {
+  let seed = 20260903;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+  const out: Screen[] = [];
+  for (let i = 0; i < count; i++) {
+    // golden angle keeps the ring evenly covered instead of clumping
+    const angle = i * 2.3999632 + rnd() * 0.5;
+    const radius = 360 + rnd() * 720;
+    const x = Math.cos(angle) * radius;
+    const y = Math.sin(angle) * radius * 0.66;
+    const w = 170 + rnd() * 210;
+    out.push({
+      x, y,
+      z: -(i * SPACING + rnd() * SPACING * 0.5),
+      yaw: Math.max(-46, Math.min(46, -x / 16)),
+      w, h: Math.round(w * 0.62),
+      story: stories[i % stories.length],
+    });
+  }
+  return out;
+}
 
 export function TunnelHero() {
   const sectionRef = useRef<HTMLDivElement>(null);
-  const corridorRef = useRef<HTMLDivElement>(null);
-  const blurRef = useRef<HTMLDivElement>(null);
-  const endRef = useRef<HTMLDivElement>(null);
-  const screenRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const velRef = useRef(0);
-  const [phase, setPhase] = useState(0); // 0 hero, 1 mid, 2 arrival
+  const stageRef = useRef<HTMLDivElement>(null);
+  const refs = useRef<(HTMLDivElement | null)[]>([]);
+  const [phase, setPhase] = useState(0);
   const [reduce, setReduce] = useState(false);
   const [hud, setHud] = useState({ p: 0, v: 0 });
 
-  const screens = useMemo(() => {
-        const out: { z: number; wall: Wall; story: (typeof stories)[number]; i: number }[] = [];
-    let k = 0;
-    for (let r = 0; r < RINGS; r++) {
-      const z = -r * SPACING;
-      // side walls only: the centre of the frame stays empty, as in a title card
-      const useWalls = ["L", "R"] as Wall[];
-      useWalls.forEach((w) => {
-        out.push({ z, wall: w, story: stories[k % stories.length], i: k });
-        k++;
-      });
-    }
-    return out;
-  }, []);
+  const screens = useMemo(() => build(COUNT), []);
 
   useEffect(() => {
     const rm = window.matchMedia("(prefers-reduced-motion: reduce)");
-    setReduce(rm.matches);
-    const onRm = () => setReduce(rm.matches);
-    rm.addEventListener?.("change", onRm);
+    if (rm.matches) { setReduce(true); return; }
 
     let raf = 0;
+    // narrow viewports pull the cloud inward so it never sits on the titles
+    let k = Math.max(0.42, Math.min(1, window.innerWidth / 1440));
+    const onResize = () => {
+      k = Math.max(0.42, Math.min(1, window.innerWidth / 1440));
+      refs.current.forEach((n, i) => {
+        if (!n) return;
+        const sc = screens[i];
+        n.style.width = `${sc.w * k}px`;
+        n.style.height = `${sc.h * k}px`;
+        n.style.marginLeft = `${(-sc.w * k) / 2}px`;
+        n.style.marginTop = `${(-sc.h * k) / 2}px`;
+      });
+    };
+    onResize();
+    window.addEventListener("resize", onResize);
+
     let lastY = window.scrollY;
     let lastT = performance.now();
+    let vel = 0;
     let prevPhase = -1;
-    let hudTick = 0;
+    let tick = 0;
+    const blurCache = new Float32Array(screens.length).fill(-1);
 
     const frame = (t: number) => {
       const el = sectionRef.current;
-      const corridor = corridorRef.current;
-      if (!el || !corridor) { raf = requestAnimationFrame(frame); return; }
+      const stage = stageRef.current;
+      if (!el || !stage) { raf = requestAnimationFrame(frame); return; }
 
       const rect = el.getBoundingClientRect();
-      const total = el.offsetHeight - window.innerHeight;
-      const p = Math.min(1, Math.max(0, -rect.top / Math.max(1, total)));
+      const travel = el.offsetHeight - window.innerHeight;
+      const p = Math.min(1, Math.max(0, -rect.top / Math.max(1, travel)));
 
-      // velocity (px per ms), smoothed
+      // smoothed scroll velocity, px per ms
       const y = window.scrollY;
       const dt = Math.max(8, t - lastT);
       const inst = (y - lastY) / dt;
       lastY = y; lastT = t;
-      const smooth = rm.matches ? 0 : velRef.current + (inst - velRef.current) * 0.14;
-      velRef.current = Math.abs(smooth) < 0.001 ? 0 : smooth;
+      vel += (inst - vel) * 0.16;
+      const speed = Math.abs(vel) < 0.001 ? 0 : Math.abs(vel);
 
-      const speed = Math.abs(velRef.current); // ~0 (idle) .. ~4 (hard scrub)
-      const blur = rm.matches ? 0 : Math.min(26, speed * 9);
-      const stretch = rm.matches ? 1 : 1 + Math.min(0.09, speed * 0.028);
+      const blur = Math.min(11, speed * 6);
+      const camZ = p * DEPTH * 1.9;
 
-      const camZ = p * DEPTH;
-      corridor.style.transform = `translate3d(0,0,${camZ}px)`;
-
-      if (blurRef.current) {
-        blurRef.current.style.filter = blur > 0.3 ? `blur(${blur.toFixed(1)}px) saturate(${1 + Math.min(0.5, speed * 0.18)})` : "none";
-        blurRef.current.style.transform = `scale3d(${stretch}, ${stretch}, 1)`;
-        // at rest the corridor is a rumour in the dark; motion and depth bring it up
-        blurRef.current.style.opacity = String(Math.min(1, 0.32 + p * 1.1 + Math.min(0.35, speed * 0.2)));
-      }
-
-      // per-screen visibility relative to camera
-      const refs = screenRefs.current;
       for (let i = 0; i < screens.length; i++) {
-        const s = refs[i]; if (!s) continue;
-        const zWorld = screens[i].z + camZ; // 0 = at camera plane
-        let o = 0;
-        if (zWorld < 120) {
-          const d = -zWorld;
-          o = d < 400 ? 1 : d > DEPTH * 0.9 ? Math.max(0, 1 - (d - DEPTH * 0.9) / (DEPTH * 0.35)) : 1;
-          if (zWorld > -60) o *= Math.max(0, (120 - zWorld) / 180);
+        const node = refs.current[i];
+        if (!node) continue;
+        const s = screens[i];
+
+        // wrap depth into [-DEPTH, 0): the corridor loops forever
+        const raw = s.z + camZ;
+        const z = ((raw % DEPTH) + DEPTH) % DEPTH - DEPTH;
+
+        // fade in from the far end, fade out as it sweeps past the camera
+        const far = 1 - Math.max(0, (-z - DEPTH * 0.55) / (DEPTH * 0.45));
+        const near = Math.min(1, -z / NEAR_FADE);
+        const o = Math.max(0, Math.min(1, far)) * near * 0.92;
+
+        node.style.transform = `translate3d(${s.x * k}px, ${s.y * k}px, ${z}px) rotateY(${s.yaw}deg)`;
+        node.style.opacity = o.toFixed(3);
+
+        // per-screen blur, quantised so we only touch style when it actually changes
+        const q = Math.round(blur * 2) / 2;
+        if (blurCache[i] !== q) {
+          blurCache[i] = q;
+          node.style.filter = q > 0.4 ? `blur(${q}px)` : "";
         }
-        s.style.opacity = o.toFixed(3);
-        s.style.visibility = o <= 0.01 ? "hidden" : "visible";
       }
 
-      if (endRef.current) {
-        const dz = END_Z + camZ; // approaches 0 as camera arrives
-        const near = Math.max(0, Math.min(1, 1 - (-dz) / 3400));
-        endRef.current.style.opacity = (near * near).toFixed(3);
-      }
-
-      const ph = p < 0.32 ? 0 : p < 0.72 ? 1 : 2;
+      const ph = p < 0.34 ? 0 : p < 0.74 ? 1 : 2;
       if (ph !== prevPhase) { prevPhase = ph; setPhase(ph); }
-      if (++hudTick % 6 === 0) setHud({ p, v: speed });
+      if (++tick % 6 === 0) setHud({ p, v: speed });
 
       raf = requestAnimationFrame(frame);
     };
+
     raf = requestAnimationFrame(frame);
-    return () => { cancelAnimationFrame(raf); rm.removeEventListener?.("change", onRm); };
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", onResize); };
   }, [screens]);
 
   return (
-    <section ref={sectionRef} className="relative" style={{ height: reduce ? "100vh" : "460vh" }} aria-label="Cinematic tunnel">
+    <section
+      ref={sectionRef}
+      className="relative"
+      style={{ height: reduce ? "100vh" : "460vh" }}
+      aria-label="Cinematic tunnel"
+    >
       <div className="sticky top-0 h-screen overflow-hidden" style={{ background: "var(--bg)" }}>
-        {/* atmospheric backdrop */}
-        <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(60% 50% at 50% 50%, var(--atmo-1), transparent 70%), radial-gradient(40% 40% at 50% 55%, var(--atmo-2), transparent 70%)" }} />
+        <div
+          className="absolute inset-0 pointer-events-none"
+          style={{ background: "radial-gradient(60% 50% at 50% 50%, var(--atmo-1), transparent 70%), radial-gradient(40% 40% at 50% 55%, var(--atmo-2), transparent 70%)" }}
+        />
 
-        {/* BLURRED LAYER — corridor only */}
-        <div ref={blurRef} className="absolute inset-0 will-change-[filter,transform,opacity]" style={{ transformOrigin: "50% 50%", opacity: 0.32 }}>
-          <div className="absolute inset-0" style={{ perspective: "820px", perspectiveOrigin: "50% 50%" }}>
-            <div ref={corridorRef} className="absolute inset-0 will-change-transform" style={{ transformStyle: "preserve-3d" }}>
-              {screens.map((s, i) => (
-                <Screen key={i} ref={(el) => { screenRefs.current[i] = el; }} {...s} />
-              ))}
-              {/* end wall */}
-              <div ref={endRef} className="absolute left-1/2 top-1/2 on-image" style={{ transform: `translate3d(-50%,-50%,${END_Z}px)`, width: "min(1400px, 140vw)", height: "min(900px, 90vh)", opacity: 0 }}>
-                <div className="still deep vignette h-full w-full" style={{ borderRadius: 28 }}>
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={stories[0].cover} alt="" className="anim-drift" />
-                </div>
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="text-center">
-                    <div className="label text-accent mb-6">Now arriving</div>
-                    <div className="display text-[7vw] md:text-[4.2vw] leading-[1.06] text-ink">Stories<br />Waiting<br />For Cinema</div>
-                  </div>
-                </div>
-              </div>
-              {/* rails / guide lines */}
-              <Rails />
-            </div>
+        {/* CORRIDOR */}
+        <div className="absolute inset-0" style={{ perspective: `${PERSPECTIVE}px`, perspectiveOrigin: "50% 50%" }}>
+          <div ref={stageRef} className="absolute left-1/2 top-1/2" style={{ transformStyle: "preserve-3d" }}>
+            {screens.map((s, i) => (
+              <ScreenPane key={i} ref={(el) => { refs.current[i] = el; }} screen={s} eager={i < 10} reduce={reduce} index={i} />
+            ))}
           </div>
-          {/* vanishing glow */}
-          <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(22% 18% at 50% 50%, var(--glow), transparent 100%)" }} />
         </div>
 
-        {/* SHARP LAYER — titles never blur. Composed like a title card: wordmark, a centre mark, a sentence to navigate by. */}
+        {/* vanishing glow and a soft scrim: the corridor stays visible, the titles stay readable */}
+        <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(26% 22% at 50% 50%, var(--glow), transparent 100%)" }} />
+        <div
+          className="absolute inset-0 pointer-events-none transition-opacity duration-700"
+          style={{ background: "radial-gradient(38% 30% at 50% 50%, var(--bg) 0%, color-mix(in srgb, var(--bg) 55%, transparent) 55%, transparent 100%)", opacity: phase === 2 ? 0 : 0.8 }}
+        />
+
+        {/* edge scrims: the corridor fades out where the type lives */}
+        <div className="absolute inset-x-0 top-0 h-[26vh] pointer-events-none" style={{ background: "linear-gradient(180deg, var(--bg) 0%, color-mix(in srgb, var(--bg) 55%, transparent) 55%, transparent 100%)" }} />
+        <div className="absolute inset-x-0 bottom-0 h-[30vh] pointer-events-none" style={{ background: "linear-gradient(0deg, var(--bg) 0%, color-mix(in srgb, var(--bg) 62%, transparent) 55%, transparent 100%)" }} />
+
+        {/* SHARP LAYER — titles never blur */}
         <div className="absolute inset-0 pointer-events-none">
-          {/* phase 0: the title card */}
           <div className={cn("absolute inset-0 transition-all duration-700 ease-cine", phase === 0 ? "opacity-100" : "opacity-0 -translate-y-4")}>
-            <div className="absolute inset-x-0 top-[18vh] md:top-[16vh] flex flex-col items-center">
-              <Wordmark />
-            </div>
+            <div className="absolute inset-x-0 top-[18vh] md:top-[16vh] flex flex-col items-center"><Wordmark /></div>
             <div className="absolute inset-0 flex items-center justify-center">
               <Link href="/discover" className="pointer-events-auto group flex flex-col items-center gap-4 anim-in d-8">
                 <span className="relative h-6 w-6 md:h-7 md:w-7" aria-hidden>
@@ -178,7 +203,6 @@ export function TunnelHero() {
             </nav>
           </div>
 
-          {/* phase 1: the corridor speaks */}
           <div className={cn("absolute inset-0 flex items-center justify-center px-6 transition-all duration-700 ease-cine", phase === 1 ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4 pointer-events-none")}>
             <div className="text-center max-w-4xl">
               <div className="sub mb-6">The corridor</div>
@@ -187,13 +211,11 @@ export function TunnelHero() {
             </div>
           </div>
 
-          {/* phase 2: arrival */}
           <div className={cn("absolute bottom-[12vh] left-0 right-0 px-6 md:px-14 flex items-end justify-between transition-all duration-700 ease-cine", phase === 2 ? "opacity-100" : "opacity-0 pointer-events-none")}>
             <div className="sub">12 stories · 8 creators · 6 films in development</div>
             <div className="sub hidden md:block">Keep scrolling</div>
           </div>
 
-          {/* HUD: velocity meter */}
           <div className="absolute bottom-6 left-6 md:left-14 flex items-center gap-4 sub">
             <span className="hidden sm:inline">Velocity</span>
             <span className="bar w-24"><span style={{ width: `${Math.min(100, hud.v * 25)}%`, transition: "width 120ms linear" }} /></span>
@@ -206,56 +228,57 @@ export function TunnelHero() {
   );
 }
 
-
-const Screen = forwardRef<HTMLDivElement, { z: number; wall: Wall; story: (typeof stories)[number]; i: number }>(function Screen({ z, wall, story, i }, ref) {
-  const w = "min(620px, 78vw)", h = "min(350px, 44vw)";
-  const lateral = i % 2 === 0 ? 0 : (wall === "T" || wall === "B" ? (i % 4 === 1 ? -220 : 220) : 0);
-  const transform =
-    wall === "L" ? `translate3d(calc(-50% - 44vw), -50%, ${z}px) rotateY(90deg)` :
-    wall === "R" ? `translate3d(calc(-50% + 44vw), -50%, ${z}px) rotateY(-90deg)` :
-    wall === "T" ? `translate3d(calc(-50% + ${lateral}px), calc(-50% - 36vh), ${z}px) rotateX(-90deg)` :
-                   `translate3d(calc(-50% + ${lateral}px), calc(-50% + 36vh), ${z}px) rotateX(90deg)`;
-  const author = authorById(story.authorId);
-  return (
-    <div ref={ref} className="absolute left-1/2 top-1/2 will-change-[opacity] on-image" style={{ width: w, height: h, transform, backfaceVisibility: "hidden", opacity: 0 }}>
-      <div className="still vignette h-full w-full border border-line" style={{ borderRadius: 18 }}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={story.cover} alt="" loading={i < 8 ? "eager" : "lazy"} />
-        <div className="absolute inset-x-0 bottom-0 p-5 flex items-end justify-between z-[2]">
-          <div>
-            <div className="label-sm text-ink-3">{story.genre} · {story.format}</div>
-            <div className="display text-xl text-ink mt-2">{story.title}</div>
-            <div className="text-xs text-ink-2 mt-1">{author.name}</div>
-          </div>
-          <div className="text-right">
-            <div className="numeral text-3xl text-accent">{story.screenability}%</div>
-            <div className="label-sm text-ink-3">screenable</div>
+const ScreenPane = forwardRef<HTMLDivElement, { screen: Screen; eager: boolean; reduce: boolean; index: number }>(
+  function ScreenPane({ screen, eager, reduce, index }, ref) {
+    const { story } = screen;
+    const author = authorById(story.authorId);
+    return (
+      <div
+        ref={ref}
+        className="absolute on-image"
+        style={{
+          width: screen.w,
+          height: screen.h,
+          marginLeft: -screen.w / 2,
+          marginTop: -screen.h / 2,
+          transform: reduce
+            ? `translate3d(${screen.x}px, ${screen.y}px, ${screen.z / 6}px) rotateY(${screen.yaw}deg)`
+            : `translate3d(${screen.x}px, ${screen.y}px, ${screen.z}px) rotateY(${screen.yaw}deg)`,
+          opacity: reduce ? 0.5 : 0,
+          backfaceVisibility: "hidden",
+          willChange: "transform, opacity",
+          contain: "layout paint style",
+        }}
+        aria-hidden
+      >
+        <div className="still vignette h-full w-full border border-line" style={{ borderRadius: 10 }}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={thumb(story.cover)} alt="" loading={eager ? "eager" : "lazy"} decoding="async" draggable={false} />
+          <div className="absolute inset-x-0 bottom-0 p-2.5 z-[2]">
+            <div className="display text-[0.62rem] leading-tight text-ink truncate">{story.title}</div>
+            <div className="flex items-baseline justify-between mt-1">
+              <span className="text-[0.5rem] text-ink-3 truncate">{author.name}</span>
+              <span className="numeral text-[0.6rem] text-accent">{story.screenability}%</span>
+            </div>
           </div>
         </div>
       </div>
-    </div>
-  );
-});
+    );
+  },
+);
 
 function Wordmark() {
   const letters = "BORN CINEMA".split("");
   return (
     <div className="flex flex-col items-center">
       <div className="display text-[1.35rem] md:text-[1.8rem] text-ink" style={{ letterSpacing: "0.42em" }} aria-label="Born Cinema">
-        {letters.map((l, i) => <span key={i} className="inline-block anim-in" style={{ animationDelay: `${200 + i * 70}ms` }}>{l === " " ? "\u00A0" : l}</span>)}
+        {letters.map((l, i) => (
+          <span key={i} className="inline-block anim-in" style={{ animationDelay: `${200 + i * 70}ms` }}>
+            {l === " " ? " " : l}
+          </span>
+        ))}
       </div>
       <div className="sub mt-3 anim-in d-8">Where cinema is born</div>
     </div>
-  );
-}
-
-function Rails() {
-  const lines = Array.from({ length: 6 });
-  return (
-    <>
-      {lines.map((_, i) => (
-        <div key={i} className="absolute left-1/2 top-1/2" style={{ width: 2, height: DEPTH + 1600, transformOrigin: "50% 0%", transform: `translate3d(-50%, -50%, 0) rotateX(90deg) translate3d(${(i - 2.5) * 30}vw, 0, ${-36}vh)`, background: "linear-gradient(180deg, transparent, var(--line) 30%, var(--line) 70%, transparent)", opacity: 0.6 }} />
-      ))}
-    </>
   );
 }
