@@ -4,6 +4,9 @@ import { db, type User } from "./db";
 
 const COOKIE = "bc_session";
 const SECRET = process.env.SESSION_SECRET || "born-cinema-prototype-secret";
+if (!process.env.SESSION_SECRET && process.env.NODE_ENV === "production") {
+  console.warn("[session] SESSION_SECRET is not set. Cookies are signed with a public default; set it before real use.");
+}
 
 const sign = (payload: string) => createHmac("sha256", SECRET).update(payload).digest("base64url");
 export function encodeSession(user: Pick<User, "id" | "role">) {

@@ -58,6 +58,26 @@ src/middleware.ts     members only under /dashboard
 
 The JSON store is a stand-in for a database; every access goes through `src/lib/server/db.ts`.
 
+## Deploying
+
+The prototype defaults to a JSON store in `.data/`, which cannot persist on a read-only
+serverless filesystem. For a real deployment connect Appwrite:
+
+```bash
+# .env.local
+APPWRITE_ENDPOINT=https://cloud.appwrite.io/v1
+APPWRITE_PROJECT_ID=...
+APPWRITE_API_KEY=...
+APPWRITE_DATABASE_ID=borncinema
+```
+
+```bash
+npm run appwrite:setup   # creates collections, indexes and demo accounts, idempotently
+```
+
+`/api/health` reports which backend is live and whether it can persist. Full steps, including
+Cloudinary and Cloudflare R2 for image uploads, are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ## Build without disturbing a running dev server
 
 ```bash

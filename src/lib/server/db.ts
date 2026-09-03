@@ -1,10 +1,12 @@
 import { promises as fs } from "fs";
 import path from "path";
 import { slugify } from "@/lib/utils";
+import { appwriteDb } from "./db-appwrite";
 
 /**
- * Server-side JSON store for the prototype. Swap for a real database by re-implementing these
- * functions; nothing above this layer knows it is a file.
+ * The store. Two implementations satisfy the same `Store` contract:
+ * a JSON file for local work, and Appwrite when its environment variables are present.
+ * Nothing above this layer knows which one it is talking to.
  */
 export type Role = "creator" | "superadmin";
 export interface User {
@@ -27,10 +29,41 @@ export interface StoryDoc {
   project?: unknown;
   stats: { readers: number; likes: number; comments: number; saves: number; watchVotes: number; completion: number };
 }
+export type NewUser = { name: string; role?: Role; email?: string; passwordHash?: string; handle?: string; bio?: string; makes?: string[]; genres?: string[]; location?: string };
+export type NewStory = Omit<StoryDoc, "id" | "slug" | "createdAt" | "updatedAt" | "stats"> & { slug?: string };
+export type UserPatch = Partial<Pick<User, "name" | "bio" | "makes" | "genres" | "location" | "passwordHash">>;
+export type StoryFilter = { authorId?: string; status?: StoryStatus | StoryStatus[] };
+
+/** Every backend must provide exactly this. */
+export interface Store {
+  users(): Promise<User[]>;
+  user(uid: string): Promise<User | null>;
+  userByHandle(handle: string): Promise<User | null>;
+  userByEmail(email: string): Promise<User | null>;
+  handleAvailable(handle: string): Promise<boolean>;
+  createUser(input: NewUser): Promise<User>;
+  updateUser(uid: string, patch: UserPatch): Promise<User | null>;
+  stories(filter?: StoryFilter): Promise<StoryDoc[]>;
+  story(sid: string): Promise<StoryDoc | null>;
+  storyBySlug(slug: string): Promise<StoryDoc | null>;
+  createStory(input: NewStory): Promise<StoryDoc>;
+  updateStory(sid: string, patch: Partial<StoryDoc>): Promise<StoryDoc | null>;
+  deleteStory(sid: string): Promise<void>;
+}
+
 interface Db { users: User[]; stories: StoryDoc[] }
 
-const DIR = path.join(process.cwd(), ".data");
+/**
+ * Where the JSON store lives. Serverless hosts mount a read-only filesystem outside the
+ * temp directory, so BC_DATA_DIR lets a deployment point this somewhere writable.
+ */
+const DIR = process.env.BC_DATA_DIR || path.join(process.cwd(), ".data");
 const FILE = path.join(DIR, "db.json");
+
+/** Set once the filesystem refuses a write: from then on the store is memory-only. */
+let readOnly = false;
+let warned = false;
+export const storeIsPersistent = () => !readOnly;
 
 const seed = (): Db => ({
   users: [
@@ -46,25 +79,50 @@ let writing: Promise<void> = Promise.resolve();
 
 async function load(): Promise<Db> {
   if (cache) return cache;
-  try { cache = JSON.parse(await fs.readFile(FILE, "utf8")); }
-  catch { cache = seed(); await persist(); }
+  try {
+    cache = JSON.parse(await fs.readFile(FILE, "utf8"));
+  } catch {
+    cache = seed();
+    await persist();
+  }
   return cache!;
 }
+
+/**
+ * Best effort. If the filesystem is read-only the seeded data stays in memory and the app
+ * keeps serving, rather than throwing out of every page that touches the store.
+ */
 async function persist() {
+  if (readOnly) return;
   const snapshot = JSON.stringify(cache, null, 2);
-  writing = writing.then(async () => { await fs.mkdir(DIR, { recursive: true }); await fs.writeFile(FILE, snapshot, "utf8"); });
+  writing = writing
+    .then(async () => {
+      await fs.mkdir(DIR, { recursive: true });
+      await fs.writeFile(FILE, snapshot, "utf8");
+    })
+    .catch((e) => {
+      readOnly = true;
+      if (!warned) {
+        warned = true;
+        console.warn(
+          `[store] cannot write ${FILE} (${(e as Error).message}). Running memory-only: ` +
+            "nothing members create will survive a restart. Configure Appwrite, or set BC_DATA_DIR " +
+            "to a writable path, for a deployment.",
+        );
+      }
+    });
   await writing;
 }
 
 const id = (p: string) => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
-export const db = {
+export const localDb: Store = {
   async users() { return (await load()).users; },
   async user(uid: string) { return (await load()).users.find((u) => u.id === uid) || null; },
   async userByHandle(handle: string) { return (await load()).users.find((u) => u.handle.toLowerCase() === handle.toLowerCase()) || null; },
   async userByEmail(email: string) { return (await load()).users.find((u) => u.email?.toLowerCase() === email.toLowerCase()) || null; },
-  async handleAvailable(handle: string) { return !(await db.userByHandle(handle)); },
-  async createUser(input: { name: string; role?: Role; email?: string; passwordHash?: string; handle?: string; bio?: string; makes?: string[]; genres?: string[]; location?: string }) {
+  async handleAvailable(handle: string) { return !(await localDb.userByHandle(handle)); },
+  async createUser(input: NewUser) {
     const d = await load();
     const base = slugify(input.handle || input.name) || "creator";
     let handle = base; let n = 1;
@@ -72,19 +130,19 @@ export const db = {
     const u: User = { id: id("u"), handle, name: input.name, role: input.role || "creator", createdAt: new Date().toISOString(), email: input.email, passwordHash: input.passwordHash, bio: input.bio, makes: input.makes, genres: input.genres, location: input.location };
     d.users.push(u); await persist(); return u;
   },
-  async updateUser(uid: string, patch: Partial<Pick<User, "name" | "bio" | "makes" | "genres" | "location" | "passwordHash">>) {
+  async updateUser(uid: string, patch: UserPatch) {
     const d = await load();
     const i = d.users.findIndex((u) => u.id === uid); if (i < 0) return null;
     d.users[i] = { ...d.users[i], ...patch }; await persist(); return d.users[i];
   },
-  async stories(filter: { authorId?: string; status?: StoryStatus | StoryStatus[] } = {}) {
+  async stories(filter: StoryFilter = {}) {
     const d = await load();
     return d.stories.filter((s) => (!filter.authorId || s.authorId === filter.authorId) && (!filter.status || (Array.isArray(filter.status) ? filter.status.includes(s.status) : s.status === filter.status)))
       .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   },
   async story(sid: string) { return (await load()).stories.find((s) => s.id === sid) || null; },
   async storyBySlug(slug: string) { return (await load()).stories.find((s) => s.slug === slug) || null; },
-  async createStory(input: Omit<StoryDoc, "id" | "slug" | "createdAt" | "updatedAt" | "stats"> & { slug?: string }) {
+  async createStory(input: NewStory) {
     const d = await load();
     const base = slugify(input.title) || "untitled"; let slug = base; let n = 1;
     while (d.stories.some((s) => s.slug === slug)) slug = `${base}-${++n}`;
@@ -100,3 +158,13 @@ export const db = {
   },
   async deleteStory(sid: string) { const d = await load(); d.stories = d.stories.filter((s) => s.id !== sid); await persist(); },
 };
+
+/**
+ * Pick the backend from the environment. With no Appwrite variables the JSON store is used,
+ * so the prototype keeps working out of the box and unsetting them is a complete rollback.
+ * Importing the Appwrite module is harmless without credentials: it builds its client lazily
+ * on first use, so nothing connects until a call is actually made.
+ */
+export const db: Store = process.env.APPWRITE_PROJECT_ID ? appwriteDb : localDb;
+
+export const backendName = process.env.APPWRITE_PROJECT_ID ? "appwrite" : "local-json";
